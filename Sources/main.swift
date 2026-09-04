@@ -1,10 +1,12 @@
 import AppKit
+import Network
 import ServiceManagement
 
 // MARK: - Ping source
 
 /// Runs one long lived `ping -i 1 <host>` process and reports each reply.
-/// The process is restarted automatically if it dies (network change, sleep/wake).
+/// The process is restarted when it dies, when the network path changes,
+/// and when it stops giving replies (a stale ICMP socket after a route change).
 final class PingMonitor {
 
     enum Sample {
@@ -18,6 +20,7 @@ final class PingMonitor {
     private var process: Process?
     private var buffer = Data()
     private var stopped = false
+    private var generation = 0          // ignores output from a replaced process
     private let queue = DispatchQueue(label: "pingbar.monitor")
 
     init(host: String) {
@@ -31,9 +34,11 @@ final class PingMonitor {
 
     func stop() {
         stopped = true
+        generation &+= 1
         process?.terminationHandler = nil
         process?.terminate()
         process = nil
+        queue.async { [weak self] in self?.buffer.removeAll() }
     }
 
     func restart() {
@@ -42,6 +47,9 @@ final class PingMonitor {
     }
 
     private func launch() {
+        generation &+= 1
+        let gen = generation
+
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/sbin/ping")
         // -i 1  : one probe per second
@@ -54,37 +62,46 @@ final class PingMonitor {
 
         out.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
-            guard !data.isEmpty else { return }
-            self?.queue.async { self?.consume(data) }
+            guard !data.isEmpty else {
+                // End of file. Without this the handler fires in a tight loop.
+                handle.readabilityHandler = nil
+                return
+            }
+            self?.queue.async { self?.consume(data, gen: gen) }
         }
 
         task.terminationHandler = { [weak self] _ in
-            guard let self, !self.stopped else { return }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                guard !self.stopped else { return }
-                self.launch()
-            }
+            out.fileHandleForReading.readabilityHandler = nil
+            self?.relaunchAfterFailure(gen: gen)
         }
 
         do {
             try task.run()
             process = task
         } catch {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
-                guard let self, !self.stopped else { return }
-                self.launch()
-            }
+            relaunchAfterFailure(gen: gen)
         }
     }
 
-    private func consume(_ data: Data) {
+    private func relaunchAfterFailure(gen: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            guard let self, !self.stopped, gen == self.generation else { return }
+            self.launch()
+        }
+    }
+
+    private func consume(_ data: Data, gen: Int) {
+        guard gen == generation else { return }
         buffer.append(data)
         while let idx = buffer.firstIndex(of: 0x0A) {
             let lineData = buffer[buffer.startIndex..<idx]
             buffer.removeSubrange(buffer.startIndex...idx)
             guard let line = String(data: lineData, encoding: .utf8) else { continue }
             if let sample = Self.parse(line) {
-                DispatchQueue.main.async { [weak self] in self?.onSample?(sample) }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, gen == self.generation else { return }
+                    self.onSample?(sample)
+                }
             }
         }
     }
@@ -92,9 +109,8 @@ final class PingMonitor {
     /// "64 bytes from 1.1.1.1: icmp_seq=390 ttl=46 time=43.251 ms" -> .reply(43.251)
     /// "Request timeout for icmp_seq 391"                          -> .lost
     static func parse(_ line: String) -> Sample? {
-        if let range = line.range(of: "time="), line.hasSuffix(" ms") || line.contains(" ms") {
-            let rest = line[range.upperBound...]
-            let digits = rest.prefix { $0.isNumber || $0 == "." }
+        if let range = line.range(of: "time=") {
+            let digits = line[range.upperBound...].prefix { $0.isNumber || $0 == "." }
             if let value = Double(digits) { return .reply(value) }
         }
         if line.contains("Request timeout")
@@ -112,10 +128,20 @@ final class PingMonitor {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
 
+    /// Show the red placeholder after this many seconds with no reply.
+    private let staleAfter: TimeInterval = 3
+    /// Restart the ping process after this many seconds with no reply.
+    private let restartAfter: TimeInterval = 8
+    /// Never restart more often than this.
+    private let restartCooldown: TimeInterval = 15
+
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private var monitor: PingMonitor?
     private var lastSampleAt = Date.distantPast
+    private var lastRestartAt = Date.distantPast
     private var watchdog: Timer?
+    private let pathMonitor = NWPathMonitor()
+    private var lastPathKey: String?
 
     private var host: String {
         UserDefaults.standard.string(forKey: "host") ?? "1.1.1.1"
@@ -127,25 +153,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         buildMenu()
         startMonitor()
 
-        // A probe every second: if nothing arrives for 3 s the link is down.
         watchdog = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            if Date().timeIntervalSince(self.lastSampleAt) > 3 {
-                self.render(text: "-- ms", warning: true)
-            }
+            self?.checkForStall()
         }
 
-        // ping keeps running across sleep, but the socket is often dead on wake.
+        // A route change (Wi-Fi switch, VPN, cable) leaves the open ICMP socket
+        // on the old path. The process then reports timeouts until it is replaced.
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            let key = path.availableInterfaces.map(\.name).joined(separator: ",") + "|\(path.status)"
+            DispatchQueue.main.async {
+                guard let self else { return }
+                defer { self.lastPathKey = key }
+                guard self.lastPathKey != nil, self.lastPathKey != key else { return }
+                self.restartMonitor(force: true)
+            }
+        }
+        pathMonitor.start(queue: DispatchQueue(label: "pingbar.path"))
+
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            self?.monitor?.restart()
+            self?.restartMonitor(force: true)
         }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         monitor?.stop()
     }
+
+    // MARK: Monitor control
 
     private func startMonitor() {
         monitor?.stop()
@@ -157,11 +193,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             case .reply(let ms):
                 self.render(text: "\(Int(ms.rounded())) ms", warning: false)
             case .lost:
-                self.render(text: "-- ms", warning: true)
+                break   // the watchdog decides when the value is too old
             }
         }
         m.start()
         monitor = m
+        lastRestartAt = Date()
+    }
+
+    private func restartMonitor(force: Bool) {
+        if !force, Date().timeIntervalSince(lastRestartAt) < restartCooldown { return }
+        lastRestartAt = Date()
+        monitor?.restart()
+    }
+
+    private func checkForStall() {
+        let age = Date().timeIntervalSince(lastSampleAt)
+        if age > staleAfter {
+            render(text: "-- ms", warning: true)
+        }
+        // No reply for a long time, but the process is alive: replace it.
+        if age > restartAfter {
+            restartMonitor(force: false)
+        }
     }
 
     private func render(text: String, warning: Bool) {
@@ -196,6 +250,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
+        let restart = NSMenuItem(title: "Restart Ping", action: #selector(restartNow), keyEquivalent: "r")
+        restart.target = self
+        menu.addItem(restart)
+
         let login = NSMenuItem(title: "Open at Login", action: #selector(toggleLoginItem), keyEquivalent: "")
         login.target = self
         login.state = (SMAppService.mainApp.status == .enabled) ? .on : .off
@@ -209,6 +267,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func selectHost(_ sender: NSMenuItem) {
         setHost(sender.title)
+    }
+
+    @objc private func restartNow() {
+        render(text: "...", warning: false)
+        lastSampleAt = Date()
+        restartMonitor(force: true)
     }
 
     @objc private func promptForHost() {

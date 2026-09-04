@@ -27,9 +27,12 @@ Click the value in the menu bar to open the menu:
 - `Quit PingBar`
 
 The value becomes red `-- ms` when a reply does not come in 3 seconds.
+`Restart Ping` starts a new ping process, which is useful after a network change.
 
 ## How it works
 
 `Sources/main.swift` starts one `/sbin/ping -i 1 -n <host>` process and reads each reply
-line as it comes. The process is restarted if it stops, and also after the Mac wakes.
+line as it comes. An open ICMP socket does not follow a route change, so the process is
+replaced when it stops, when the Mac wakes, when `NWPathMonitor` reports a different
+network path, and when no reply comes for 8 seconds.
 The host is kept in `UserDefaults` (`defaults read com.github.cameralis.pingbar host`).
