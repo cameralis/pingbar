@@ -134,6 +134,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let restartAfter: TimeInterval = 8
     /// Never restart more often than this.
     private let restartCooldown: TimeInterval = 15
+    /// A reply slower than this many milliseconds makes the dot yellow.
+    private var slowAbove: Double {
+        let value = UserDefaults.standard.double(forKey: "slowAboveMs")
+        return value > 0 ? value : 100
+    }
+
+    /// The colour of the dot in front of the value.
+    private enum Health {
+        case unknown    // no measurement yet
+        case good       // a fast reply
+        case slow       // a slow reply
+        case down       // no reply
+
+        var color: NSColor {
+            switch self {
+            case .unknown: return .tertiaryLabelColor
+            case .good:    return .systemGreen
+            case .slow:    return .systemYellow
+            case .down:    return .systemRed
+            }
+        }
+    }
 
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private var monitor: PingMonitor?
@@ -149,7 +171,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem.button?.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-        render(text: "...", warning: false)
+        render(text: "...", health: .unknown)
         buildMenu()
         startMonitor()
 
@@ -191,7 +213,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.lastSampleAt = Date()
             switch sample {
             case .reply(let ms):
-                self.render(text: "\(Int(ms.rounded())) ms", warning: false)
+                self.render(text: "\(Int(ms.rounded())) ms", health: ms > self.slowAbove ? .slow : .good)
             case .lost:
                 break   // the watchdog decides when the value is too old
             }
@@ -210,7 +232,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func checkForStall() {
         let age = Date().timeIntervalSince(lastSampleAt)
         if age > staleAfter {
-            render(text: "-- ms", warning: true)
+            render(text: "-- ms", health: .down)
         }
         // No reply for a long time, but the process is alive: replace it.
         if age > restartAfter {
@@ -218,15 +240,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func render(text: String, warning: Bool) {
+    private func render(text: String, health: Health) {
         guard let button = statusItem.button else { return }
-        button.attributedTitle = NSAttributedString(
+        let title = NSMutableAttributedString(
+            string: "\u{25CF} ",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 8),
+                .foregroundColor: health.color,
+                .baselineOffset: 1.0,
+            ]
+        )
+        title.append(NSAttributedString(
             string: text,
             attributes: [
                 .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular),
-                .foregroundColor: warning ? NSColor.systemRed : NSColor.labelColor,
+                .foregroundColor: NSColor.labelColor,
             ]
-        )
+        ))
+        button.attributedTitle = title
     }
 
     // MARK: Menu
@@ -270,7 +301,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func restartNow() {
-        render(text: "...", warning: false)
+        render(text: "...", health: .unknown)
         lastSampleAt = Date()
         restartMonitor(force: true)
     }
@@ -296,7 +327,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setHost(_ value: String) {
         UserDefaults.standard.set(value, forKey: "host")
-        render(text: "...", warning: false)
+        render(text: "...", health: .unknown)
         lastSampleAt = Date()
         startMonitor()
         buildMenu()

@@ -26,7 +26,20 @@ Click the value in the menu bar to open the menu:
 - `Open at Login` starts the app with the Mac.
 - `Quit PingBar`
 
-The value becomes red `-- ms` when a reply does not come in 3 seconds.
+A dot in front of the value shows the state:
+
+| Dot | Meaning |
+|---|---|
+| Green | A reply came in 100 ms or less |
+| Yellow | A reply came, but it was slower than 100 ms |
+| Red | No reply for 3 seconds, and the value becomes `-- ms` |
+
+To change the yellow limit to 60 ms:
+
+```sh
+defaults write com.github.cameralis.pingbar slowAboveMs -int 60
+```
+
 `Restart Ping` starts a new ping process, which is useful after a network change.
 
 ## How it works
