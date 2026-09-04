@@ -3,6 +3,8 @@
 A menu bar app for macOS. It shows the round trip time to one host, for example `42 ms`,
 and updates it every second. There is no window and no Dock icon.
 
+<img src="docs/screenshot.png" width="122" alt="PingBar in the macOS menu bar, showing 40 ms">
+
 ## Build
 
 ```sh
